@@ -23,6 +23,8 @@
 @end
 
 @implementation GRXBufferedPipe {
+  BOOL _writing;
+  NSMutableArray *_queue;
   NSError *_errorOrNil;
   dispatch_queue_t _writeQueue;
 }
@@ -37,6 +39,8 @@
   if (self = [super init]) {
     _state = GRXWriterStateNotStarted;
     _writeQueue = dispatch_queue_create(NULL, DISPATCH_QUEUE_SERIAL);
+    _writing = NO;
+    _queue = [NSMutableArray array];
     dispatch_suspend(_writeQueue);
   }
   return self;
@@ -51,9 +55,40 @@
     // We need a copy, so that it doesn't mutate before it's written at the other end of the pipe.
     value = [value copy];
   }
+
+  @synchronized(self) {
+    if (_writing) {
+      [_queue addObject:value];
+      return;
+    } else {
+      _writing = YES;
+    }
+  }
+  [self writeValueAsync:value];
+}
+
+- (void)writeValue:(id)value completionHandler:(void (^)(void))completionHandler {
+    [self writeValue:value completionHandler:nil];
+}
+
+- (void)writeValueAsync:(id)value {
   __weak GRXBufferedPipe *weakSelf = self;
   dispatch_async(_writeQueue, ^(void) {
-    [weakSelf.writeable writeValue:value];
+    [weakSelf.writeable writeValue:value completionHandler:^(void) {
+      GRXBufferedPipe *strongSelf = weakSelf;
+      if (strongSelf) {
+        id value;
+        @synchronized(strongSelf) {
+          if (strongSelf->_queue.count == 0) {
+            strongSelf->_writing = NO;
+            return;
+          }
+          value = strongSelf->_queue[0];
+          [strongSelf->_queue removeObjectAtIndex:0];
+        }
+        [strongSelf writeValueAsync:value];
+      }
+    }];
   });
 }
 
@@ -113,6 +148,7 @@
 - (void)dealloc {
   GRXWriterState state = self.state;
   if (state == GRXWriterStateNotStarted || state == GRXWriterStatePaused) {
+    [_queue removeAllObjects];
     dispatch_resume(_writeQueue);
   }
 }
