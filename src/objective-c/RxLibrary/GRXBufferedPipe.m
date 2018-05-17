@@ -22,6 +22,16 @@
 @property(atomic) id<GRXWriteable> writeable;
 @end
 
+typedef void (^GRXBufferedPipeCompletionHandler)(void);
+
+@interface GRXBufferedPipeWriteOperation : NSObject
+@property(nonatomic, strong) id value;
+@property(nonatomic, strong) GRXBufferedPipeCompletionHandler completionHandler;
+@end
+
+@implementation GRXBufferedPipeWriteOperation
+@end
+
 @implementation GRXBufferedPipe {
   BOOL _writing;
   NSMutableArray *_queue;
@@ -49,6 +59,10 @@
 #pragma mark GRXWriteable implementation
 
 - (void)writeValue:(id)value {
+  [self writeValue:value completionHandler:nil];
+}
+
+- (void)writeValue:(id)value completionHandler:(void (^)(void))completionHandler {
   if ([value respondsToSelector:@selector(copy)]) {
     // Even if we're paused and with enqueued values, we can't excert back-pressure to our writer.
     // So just buffer the new value.
@@ -56,37 +70,42 @@
     value = [value copy];
   }
 
+  GRXBufferedPipeWriteOperation *writeOp = [[GRXBufferedPipeWriteOperation alloc] init];
+  writeOp.value = value;
+  writeOp.completionHandler = completionHandler;
+
   @synchronized(self) {
     if (_writing) {
-      [_queue addObject:value];
+      [_queue addObject:writeOp];
       return;
     } else {
       _writing = YES;
     }
   }
-  [self writeValueAsync:value];
+  [self startWriteOperation:writeOp];
 }
 
-- (void)writeValue:(id)value completionHandler:(void (^)(void))completionHandler {
-    [self writeValue:value completionHandler:nil];
-}
-
-- (void)writeValueAsync:(id)value {
+- (void)startWriteOperation:(GRXBufferedPipeWriteOperation *)writeOp {
   __weak GRXBufferedPipe *weakSelf = self;
+  GRXBufferedPipeCompletionHandler completionHandler = writeOp.completionHandler;
   dispatch_async(_writeQueue, ^(void) {
-    [weakSelf.writeable writeValue:value completionHandler:^(void) {
+    [weakSelf.writeable writeValue:writeOp.value completionHandler:^(void) {
+      if (completionHandler) {
+        completionHandler();
+      }
+
       GRXBufferedPipe *strongSelf = weakSelf;
       if (strongSelf) {
-        id value;
+        GRXBufferedPipeWriteOperation *nextWriteOp;
         @synchronized(strongSelf) {
           if (strongSelf->_queue.count == 0) {
             strongSelf->_writing = NO;
             return;
           }
-          value = strongSelf->_queue[0];
+          nextWriteOp = strongSelf->_queue[0];
           [strongSelf->_queue removeObjectAtIndex:0];
         }
-        [strongSelf writeValueAsync:value];
+        [strongSelf startWriteOperation:nextWriteOp];
       }
     }];
   });
